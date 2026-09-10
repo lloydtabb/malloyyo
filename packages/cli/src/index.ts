@@ -198,9 +198,10 @@ async function status(target: string | undefined, opts: { token?: string }): Pro
   console.log(`  ${s.compileError ? `✗ ${s.compileError}` : `✓ compiled ${s.compiledAt ?? ""}`}`);
 }
 
-async function loginCmd(target: string | undefined): Promise<void> {
+async function loginCmd(target: string | undefined, opts: { browser?: boolean }): Promise<void> {
   const inst = resolveInstance(resolve("."), target);
-  await login(inst.url);
+  // commander maps `--no-browser` to browser:false, defaulting to true.
+  await login(inst.url, { noBrowser: opts.browser === false });
   console.log(`✓ logged in to ${inst.name} (${inst.url})`);
 }
 
@@ -218,6 +219,7 @@ program
 program
   .command("login")
   .argument("[target]", "target name or instance URL (optional if the config has one target)")
+  .option("--no-browser", "print the sign-in URL instead of launching a browser")
   .description("sign in to an instance in your browser (stores a token)")
   .action(loginCmd);
 

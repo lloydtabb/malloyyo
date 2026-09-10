@@ -49,7 +49,17 @@ async function registerClient(registrationEndpoint: string, redirectUri: string)
   return ((await res.json()) as { client_id: string }).client_id;
 }
 
-function openBrowser(url: string): void {
+/** True where there is no browser to open: a container, a plain SSH session, CI.
+    macOS and Windows always have one; Linux needs a display server. */
+export function browserless(
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  if (platform === "darwin" || platform === "win32") return false;
+  return !env.DISPLAY && !env.WAYLAND_DISPLAY;
+}
+
+export function openBrowser(url: string): void {
   const [cmd, args] =
     process.platform === "darwin"
       ? ["open", [url]]
@@ -57,15 +67,51 @@ function openBrowser(url: string): void {
         ? ["cmd", ["/c", "start", "", url]]
         : ["xdg-open", [url]];
   try {
-    spawn(cmd as string, args as string[], { stdio: "ignore", detached: true }).unref();
+    const child = spawn(cmd as string, args as string[], { stdio: "ignore", detached: true });
+    // A missing opener (`xdg-open` is absent from every slim Linux image) is
+    // reported ASYNCHRONOUSLY, as an 'error' event — the try/catch around
+    // spawn() never sees it, and an 'error' with no listener is rethrown by
+    // Node as an uncaught exception that kills the CLI. That killed it one line
+    // after printing the URL that is supposed to be the fallback. Listening is
+    // the whole fix: we do not care why it failed, only that we survive it.
+    child.on("error", () => {});
+    child.unref();
   } catch {
     /* fall back to the printed URL */
   }
 }
 
-// Start a loopback listener on a random free port and wait for the OAuth redirect.
+/** Where the loopback redirect listener binds.
+
+    The default — port 0 on 127.0.0.1 — is right on a workstation, where the
+    browser and the CLI share a loopback interface and any free port will do.
+    A container breaks both halves of that. The port has to be known in advance
+    to be published (`docker run -p`, devcontainer `appPort`), and the forwarded
+    connection then arrives on the container's own interface, not its loopback,
+    so a listener bound to 127.0.0.1 inside the container refuses it. Set both:
+
+        MALLOYYO_OAUTH_PORT=41121 MALLOYYO_OAUTH_HOST=0.0.0.0
+
+    The redirect URI still names `localhost` in either case — that name is
+    resolved by the browser, on whatever machine the browser is running. */
+export function listenTarget(env: NodeJS.ProcessEnv = process.env): { host: string; port: number } {
+  const raw = env.MALLOYYO_OAUTH_PORT;
+  let port = 0;
+  if (raw !== undefined && raw !== "") {
+    port = Number(raw);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      throw new Error(`MALLOYYO_OAUTH_PORT must be a port number between 1 and 65535, got "${raw}"`);
+    }
+  }
+  return { host: env.MALLOYYO_OAUTH_HOST || "127.0.0.1", port };
+}
+
+// Start the loopback listener (see `listenTarget`) and wait for the OAuth redirect.
 function awaitRedirect(state: string): Promise<{ port: number; code: Promise<string>; close: () => void }> {
-  return new Promise((resolveServer) => {
+  return new Promise((resolveServer, rejectServer) => {
+    // Resolved first: a bad MALLOYYO_OAUTH_PORT should fail before there is a
+    // timer or a socket to clean up.
+    const { host, port: wanted } = listenTarget();
     let resolveCode!: (code: string) => void;
     let rejectCode!: (err: Error) => void;
     const code = new Promise<string>((res, rej) => {
@@ -94,15 +140,53 @@ function awaitRedirect(state: string): Promise<{ port: number; code: Promise<str
       else rejectCode(new Error(err ?? "state mismatch or missing code"));
     });
 
-    server.listen(0, "127.0.0.1", () => {
+    let listening = false;
+
+    // `listen` reports failure asynchronously too, so an unhandled 'error' here
+    // would kill the CLI exactly the way the missing browser did. Port 0 could
+    // hardly ever fail; a fixed MALLOYYO_OAUTH_PORT collides routinely.
+    server.on("error", (err: NodeJS.ErrnoException) => {
+      clearTimeout(timer);
+      const detail =
+        err.code === "EADDRINUSE"
+          ? `${host}:${wanted} is already in use — set MALLOYYO_OAUTH_PORT to a free port`
+          : err.message;
+      const failure = new Error(`could not start the sign-in listener: ${detail}`);
+      rejectCode(failure);
+      if (!listening) {
+        // Nothing is awaiting `code` yet, so its rejection would surface as an
+        // unhandled rejection rather than as this call failing. Settle it, then
+        // fail the call itself.
+        void code.catch(() => {});
+        rejectServer(failure);
+      }
+    });
+
+    server.listen(wanted, host, () => {
+      listening = true;
       const port = (server.address() as AddressInfo).port;
-      resolveServer({ port, code, close: () => server.close() });
+      // Clearing the timer on close matters on the failure paths: it is the
+      // only pending handle once the server is shut, so leaving it armed keeps
+      // the process alive for the full LOGIN_TIMEOUT_MS after an error.
+      resolveServer({
+        port,
+        code,
+        close: () => {
+          clearTimeout(timer);
+          server.close();
+        },
+      });
     });
   });
 }
 
+export interface LoginOptions {
+  /** Print the URL instead of launching a browser. Implied where there is none. */
+  noBrowser?: boolean;
+}
+
 /** Interactive browser login (Authorization Code + PKCE, loopback redirect). */
-export async function login(baseUrl: string): Promise<Creds> {
+export async function login(baseUrl: string, opts: LoginOptions = {}): Promise<Creds> {
   const ep = await discover(baseUrl);
   const { verifier, challenge } = pkce();
   const state = crypto.randomBytes(16).toString("base64url");
@@ -123,9 +207,24 @@ export async function login(baseUrl: string): Promise<Creds> {
       state,
     }).toString();
 
-    console.log("Opening your browser to sign in…");
-    console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
-    openBrowser(authUrl.toString());
+    if (opts.noBrowser || browserless()) {
+      console.log(`Visit this URL to sign in:\n\n  ${authUrl.toString()}\n`);
+      if (!process.env.MALLOYYO_OAUTH_PORT) {
+        // Worth saying before the wait rather than after the timeout: sign-in
+        // will complete in the browser and then redirect to a port on THIS
+        // machine that the browser cannot reach.
+        console.log(
+          "Note: sign-in redirects back to this machine on a random port.\n" +
+            "  In a container, set MALLOYYO_OAUTH_PORT and MALLOYYO_OAUTH_HOST=0.0.0.0,\n" +
+            "  and publish that port, so the browser can reach the redirect.\n",
+        );
+      }
+      console.log("Waiting for sign-in to complete…");
+    } else {
+      console.log("Opening your browser to sign in…");
+      console.log(`If it doesn't open, visit:\n  ${authUrl.toString()}\n`);
+      openBrowser(authUrl.toString());
+    }
 
     const authCode = await code;
 
