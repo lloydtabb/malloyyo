@@ -147,15 +147,39 @@ const html = (body: string, title: string) =>
   `<style>${NAV_CSS}</style></head>` +
   `<body style="margin:0">${body}</body></html>`;
 
-/** The dev server's link shape for the shared switcher: `/?d=<name>`. The bar
+/** The dev server's link shape for the shared switcher: `?d=<name>`. The bar
     itself (markup, brand, styling) lives in shared/nav so dev and every bundle
-    target render the same thing. */
-/** Dev-server link shape, the same one navHtml uses. */
+    target render the same thing.
+
+    RELATIVE, deliberately. A root-absolute `/?d=` is correct only when the page
+    is served from the origin root, which stops being true the moment anything
+    proxies it under a prefix — code-server's `/proxy/4173/`, a reverse proxy, an
+    embed. There the browser resolves `/…` against the ORIGIN, so the link walks
+    out of the dashboard entirely and the scripts 404. Resolved against the
+    document instead, both work from any depth. */
+const dashLink = (n: string) => `?d=${encodeURIComponent(n)}`;
+
+/** Every URL the served page resolves for itself, in one place so "are these
+    relative?" is a property of the module rather than of five string literals
+    scattered through two shells. `dashboard-paths.test.ts` asserts it. */
+export const DEV_PATHS = {
+  /** Sibling dashboard, for the switcher in the nav bar. */
+  dashboard: dashLink,
+  /** In-page (tag-only) bundle. */
+  inPage: (n: string) => `inpage.js?d=${encodeURIComponent(n)}`,
+  /** Artifact bundle, for a dashboard with a Dashboard.tsx. */
+  bundle: (n: string) => `bundle.js?d=${encodeURIComponent(n)}`,
+  /** Live-reload stream. */
+  events: "events",
+  /** The privileged query broker the parent shell brokers postMessage into. */
+  run: "api/run",
+} as const;
+
 const devSiblings = (dash: Dashboard, all: Dashboard[]) =>
-  siblingList(dash.name, all, (n) => `/?d=${encodeURIComponent(n)}`);
+  siblingList(dash.name, all, dashLink);
 
 function navHtml(dash: Dashboard, all: Dashboard[]): string {
-  return sharedNav(dash.name, all, (n) => `/?d=${encodeURIComponent(n)}`);
+  return sharedNav(dash.name, all, dashLink);
 }
 
 /** Shell for a TAG-ONLY dashboard: NO iframe. The runtime's DefaultDashboard
@@ -189,8 +213,8 @@ function inPageShell(
       `window.__GIVENS__=${safeJson(givenSpecs)};` +
       `window.__INITIAL_GIVENS__=${safeJson(initialGivens)};` +
       `window.__INITIAL_URLSTATE__=${safeJson(initialUrlState)}</script>` +
-      `<script>try{new EventSource('/events').onmessage=()=>location.reload();}catch(e){}</script>` +
-      `<script src="/inpage.js?d=${encodeURIComponent(dash.name)}"></script>`,
+      `<script>try{new EventSource('${DEV_PATHS.events}').onmessage=()=>location.reload();}catch(e){}</script>` +
+      `<script src="${DEV_PATHS.inPage(dash.name)}"></script>`,
     dash.title,
   );
 }
@@ -227,7 +251,7 @@ function parentShell(
       `</div>` +
       `<script>
 const f=document.getElementById('f');
-try{new EventSource('/events').onmessage=()=>location.reload();}catch(e){}
+try{new EventSource('${DEV_PATHS.events}').onmessage=()=>location.reload();}catch(e){}
 // The shareable URL has TWO namespaces the frame syncs independently:
 // '$NAME' = a given (the governed query contract), '~key' = a custom
 // component's useUrlState view-state. Each write must re-emit the other's
@@ -264,7 +288,7 @@ window.addEventListener('message',async(e)=>{
   if(!m||m.type!=='run')return;
   let out;
   try{
-    const res=await fetch('/api/run',{method:'POST',headers:{'content-type':'application/json'},
+    const res=await fetch('${DEV_PATHS.run}',{method:'POST',headers:{'content-type':'application/json'},
       body:JSON.stringify({d:${d},query:m.query,malloy:m.malloy,givens:m.givens,dashboard:m.dashboard})});
     out=await res.json();
   }catch(err){ out={ok:false,problems:[{message:String(err)}]}; }
@@ -316,7 +340,7 @@ function frameDoc(
       `window.__GIVENS__=${safeJson(givenSpecs)};` +
       `window.__INITIAL_GIVENS__=${safeJson(initialGivens)};` +
       `window.__INITIAL_URLSTATE__=${safeJson(initialUrlState)}</script>` +
-      `<script src="/bundle.js?d=${encodeURIComponent(dash.name)}"></script>`,
+      `<script src="${DEV_PATHS.bundle(dash.name)}"></script>`,
     dash.title,
   );
 }
