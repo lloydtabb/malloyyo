@@ -117,6 +117,10 @@ cd my-model-repo
 malloyyo init                         # write .mcp.json + scaffold index.malloy
 ```
 
+Rather not install a toolchain? A prebuilt image carries the CLI, Claude Code,
+`gh` and the Google Cloud SDK — open the repo in it and everything above is
+already there. See **[The development container](docs/devcontainer.md)**.
+
 `malloyyo init` sets the repo up so that **`cd my-model-repo && claude` opens in author mode** — connected to `malloyyo mcp --develop`, whose tools (`compile`, `compile_file`, `prettify`, `query`, `yo_help`) let Claude build the model *and* ask data questions of it. The server is named **`malloyyo_author`**, so the mode shows in every tool call (`mcp__malloyyo_author__…`) — no confusion with the core `malloy-cli`. `init` also scaffolds an `index.malloy` (the entry model the dashboard/publish tooling needs) if you don't have one.
 
 Two modes, chosen at launch, kept separate:
