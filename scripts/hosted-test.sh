@@ -3,8 +3,9 @@
 # SPDX-License-Identifier: MIT
 #
 # Stand up a Postgres, apply the schema, and run the DB-backed integration
-# tests against it: the hosted-explore surface (test/hosted-explore.test.ts)
-# and the CLI publish flow (test/publish-flow.test.ts). Postgres is the only
+# tests against it: the hosted-explore surface (test/hosted-explore.test.ts),
+# the device authorization grant (test/device-flow.test.ts), and the CLI publish
+# flow (test/publish-flow.test.ts). Postgres is the only
 # external dep — the Malloy models run on in-process DuckDB.
 #
 #   npm run test:hosted
@@ -231,6 +232,10 @@ npx tsx --test test/roster.test.ts
 
 echo "→ running lent-capabilities test (disable mirror + roster facts)"
 npx tsx --test test/lent-capabilities.test.ts
+
+echo "→ running device-flow test (RFC 8628 device authorization grant)"
+reset_schema
+npx tsx --test test/device-flow.test.ts
 
 echo "→ running hosted-explore test"
 reset_schema

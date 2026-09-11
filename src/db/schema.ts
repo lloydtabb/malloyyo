@@ -6,6 +6,7 @@ import {
   boolean,
   customType,
   index,
+  integer,
   jsonb,
   pgEnum,
   pgTable,
@@ -14,7 +15,6 @@ import {
   timestamp,
   uniqueIndex,
   uuid,
-  integer,
 } from "drizzle-orm/pg-core";
 
 // Postgres bytea (binary blob). Used for the gzip-compressed compiled ModelDef.
@@ -369,6 +369,45 @@ export const oauthAuthorizationCodes = pgTable(
       .default(sql`now()`),
   },
   (t) => [index("oauth_auth_codes_expires_idx").on(t.expiresAt)],
+);
+
+// RFC 8628 device authorization. The point of this grant is that NOTHING listens
+// on the client side: the CLI polls the token endpoint instead of receiving a
+// redirect, so it works where a loopback redirect cannot — a container, a
+// Codespace (where `localhost` is the user's laptop, not the machine running the
+// CLI), plain SSH, CI.
+//
+// Both codes are stored HASHED like authorization codes. The user code is still
+// looked up by hash: hash whatever the human typed and query for it.
+//
+// 10 min TTL, vs 60s for an authorization code — a person has to read a code off
+// one screen and type it into another.
+export const oauthDeviceCodes = pgTable(
+  "oauth_device_codes",
+  {
+    deviceCodeHash: text("device_code_hash").primaryKey(),
+    // Unique so two live flows can never collide on the short, human-typed code.
+    userCodeHash: text("user_code_hash").notNull().unique(),
+    clientId: text("client_id")
+      .notNull()
+      .references(() => oauthClients.id, { onDelete: "cascade" }),
+    scope: text("scope").notNull(),
+    resource: text("resource"),
+    // NULL until a signed-in human approves: this row is what binds their
+    // identity to the waiting CLI.
+    userId: uuid("user_id").references(() => users.id, { onDelete: "cascade" }),
+    approvedAt: timestamp("approved_at", { withTimezone: true }),
+    deniedAt: timestamp("denied_at", { withTimezone: true }),
+    // One-time exchange, same as an authorization code.
+    consumedAt: timestamp("consumed_at", { withTimezone: true }),
+    // Enforces the advertised `interval`; a client polling faster gets slow_down.
+    lastPolledAt: timestamp("last_polled_at", { withTimezone: true }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .notNull()
+      .default(sql`now()`),
+  },
+  (t) => [index("oauth_device_codes_expires_idx").on(t.expiresAt)],
 );
 
 // Bearer access tokens, 24h TTL. Hash stored, never the raw token.

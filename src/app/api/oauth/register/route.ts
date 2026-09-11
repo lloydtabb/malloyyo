@@ -4,11 +4,20 @@
 import { NextResponse } from "next/server";
 import { db, oauthClients } from "@/db";
 import { corsPreflight, withCors } from "@/lib/oauth/cors";
+import { DEVICE_GRANT_TYPE } from "@/lib/oauth/device-codes";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const ALLOWED_GRANT_TYPES = new Set(["authorization_code", "refresh_token"]);
+// A client registers for the flow it intends to use. The device grant is here so
+// a client that cannot receive a redirect (a container, a Codespace, CI) can
+// register for it ALONE — its redirect_uri is then inert, because the server
+// checks registered grant_types before issuing anything.
+const ALLOWED_GRANT_TYPES = new Set([
+  "authorization_code",
+  "refresh_token",
+  DEVICE_GRANT_TYPE,
+]);
 
 function err(error: string, description: string, status = 400): Response {
   return withCors(NextResponse.json({ error, error_description: description }, { status }));
