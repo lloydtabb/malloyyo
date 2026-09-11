@@ -10,6 +10,22 @@ interface Endpoints {
   authorization_endpoint: string;
   token_endpoint: string;
   registration_endpoint: string;
+  /** Present only on instances that support the device flow. Its absence is how
+      this CLI decides to fall back to the loopback redirect, so a new CLI keeps
+      working against an older server. */
+  device_authorization_endpoint?: string;
+  grant_types_supported?: string[];
+}
+
+export const DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
+
+interface DeviceAuthorization {
+  device_code: string;
+  user_code: string;
+  verification_uri: string;
+  verification_uri_complete?: string;
+  expires_in: number;
+  interval?: number;
 }
 
 interface TokenGrant {
@@ -32,7 +48,23 @@ function pkce(): { verifier: string; challenge: string } {
   return { verifier, challenge };
 }
 
-async function registerClient(registrationEndpoint: string, redirectUri: string): Promise<string> {
+/** Register a client for ONE flow, not both.
+
+    Registration records which grants a client may use, and the server enforces
+    that. So a device-flow client asks only for the device grant: the redirect URI
+    it must still supply (registration requires a non-empty list) can then never
+    be used to obtain a code, because `authorization_code` is not among its
+    grants. Registering both would leave a redirect enabled that this client never
+    intends to use. */
+async function registerClient(
+  registrationEndpoint: string,
+  redirectUri: string,
+  kind: "loopback" | "device" = "loopback",
+): Promise<string> {
+  const grantTypes =
+    kind === "device"
+      ? [DEVICE_GRANT_TYPE, "refresh_token"]
+      : ["authorization_code", "refresh_token"];
   const res = await apiFetch(registrationEndpoint, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -40,7 +72,7 @@ async function registerClient(registrationEndpoint: string, redirectUri: string)
       client_name: "malloyyo CLI",
       redirect_uris: [redirectUri],
       token_endpoint_auth_method: "none",
-      grant_types: ["authorization_code", "refresh_token"],
+      grant_types: grantTypes,
       response_types: ["code"],
       scope: "mcp",
     }),
@@ -53,7 +85,7 @@ async function registerClient(registrationEndpoint: string, redirectUri: string)
     macOS and Windows always have one; Linux needs a display server. */
 export function browserless(
   platform: NodeJS.Platform = process.platform,
-  env: NodeJS.ProcessEnv = process.env,
+  env: Record<string, string | undefined> = process.env,
 ): boolean {
   if (platform === "darwin" || platform === "win32") return false;
   return !env.DISPLAY && !env.WAYLAND_DISPLAY;
@@ -94,7 +126,11 @@ export function openBrowser(url: string): void {
 
     The redirect URI still names `localhost` in either case — that name is
     resolved by the browser, on whatever machine the browser is running. */
-export function listenTarget(env: NodeJS.ProcessEnv = process.env): { host: string; port: number } {
+/** `env` is narrowed to what this actually reads rather than NodeJS.ProcessEnv:
+    the server tsconfig augments that type with required keys (NODE_ENV), so a
+    test passing a bare `{}` fails a root typecheck even though the function only
+    ever looks at two optional strings. */
+export function listenTarget(env: Record<string, string | undefined> = process.env): { host: string; port: number } {
   const raw = env.MALLOYYO_OAUTH_PORT;
   let port = 0;
   if (raw !== undefined && raw !== "") {
@@ -185,9 +221,90 @@ export interface LoginOptions {
   noBrowser?: boolean;
 }
 
-/** Interactive browser login (Authorization Code + PKCE, loopback redirect). */
+/** Device flow (RFC 8628): print a URL and a short code, then poll. Nothing
+    listens, so this is the only variant that works where the browser and the CLI
+    are on different machines — a Codespace, a remote container, CI — and it needs
+    no published port even when they are on the same one. */
+async function deviceLogin(baseUrl: string, ep: Endpoints, opts: LoginOptions): Promise<Creds> {
+  // Registration demands a redirect URI even though this flow has none. Supply a
+  // loopback placeholder; it is inert because this client is not registered for
+  // the authorization_code grant.
+  const clientId = await registerClient(
+    ep.registration_endpoint,
+    "http://localhost/unused-by-device-flow",
+    "device",
+  );
+
+  const start = await apiFetch(ep.device_authorization_endpoint as string, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ client_id: clientId, scope: "mcp" }),
+  });
+  if (!start.ok) {
+    throw new Error(`device authorization failed: ${start.status} ${await start.text()}`);
+  }
+  const auth = (await start.json()) as DeviceAuthorization;
+
+  console.log(`\nTo sign in, visit:\n\n  ${auth.verification_uri}\n`);
+  console.log(`and enter this code:\n\n  ${auth.user_code}\n`);
+  // Offered, never opened for you: a link carrying the code is the phishing
+  // vector the code is supposed to defend against. Typing it is the check.
+  if (!opts.noBrowser && !browserless()) openBrowser(auth.verification_uri);
+  console.log("Waiting for approval…");
+
+  // The server advertises the minimum gap; polling faster earns `slow_down`.
+  let intervalMs = (auth.interval ?? 5) * 1000;
+  const deadline = Date.now() + auth.expires_in * 1000;
+
+  for (;;) {
+    if (Date.now() >= deadline) throw new Error("timed out waiting for approval");
+    await new Promise((r) => setTimeout(r, intervalMs));
+
+    const res = await apiFetch(ep.token_endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: DEVICE_GRANT_TYPE,
+        device_code: auth.device_code,
+        client_id: clientId,
+      }),
+    });
+    const body = (await res.json().catch(() => ({}))) as TokenGrant & { error?: string };
+
+    if (res.ok && body.access_token) {
+      const creds: Creds = {
+        clientId,
+        accessToken: body.access_token,
+        refreshToken: body.refresh_token,
+        expiresAt: Date.now() + (body.expires_in ?? 86400) * 1000,
+      };
+      saveCreds(baseUrl, creds);
+      return creds;
+    }
+    // `authorization_pending` is the normal case while a human decides — it is
+    // the protocol, not a failure. Everything else is terminal.
+    switch (body.error) {
+      case "authorization_pending":
+        continue;
+      case "slow_down":
+        intervalMs += 5000;
+        continue;
+      case "access_denied":
+        throw new Error("sign-in was denied");
+      case "expired_token":
+        throw new Error("the code expired before it was approved — run login again");
+      default:
+        throw new Error(`sign-in failed: ${body.error ?? `${res.status} ${res.statusText}`}`);
+    }
+  }
+}
+
+/** Interactive login. Prefers the device flow when the instance advertises it,
+    and falls back to the loopback redirect so a new CLI still works against an
+    older server. */
 export async function login(baseUrl: string, opts: LoginOptions = {}): Promise<Creds> {
   const ep = await discover(baseUrl);
+  if (ep.device_authorization_endpoint) return deviceLogin(baseUrl, ep, opts);
   const { verifier, challenge } = pkce();
   const state = crypto.randomBytes(16).toString("base64url");
 

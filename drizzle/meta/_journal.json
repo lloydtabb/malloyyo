@@ -127,6 +127,13 @@
       "when": 1788471443525,
       "tag": "0017_chat_is_public",
       "breakpoints": true
+    },
+    {
+      "idx": 18,
+      "version": "7",
+      "when": 1789095351800,
+      "tag": "0018_light_tigra",
+      "breakpoints": true
     }
   ]
 }

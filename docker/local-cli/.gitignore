@@ -1,0 +1,4 @@
+# Drop a `npm pack -w packages/cli` tarball here to build the image against an
+# unreleased CLI. The directory must exist for the Dockerfile's COPY; its
+# contents are never committed.
+*.tgz

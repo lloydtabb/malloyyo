@@ -1,0 +1,151 @@
+# syntax=docker/dockerfile:1
+
+# The DEVELOPMENT image for Malloy model repos. Not to be confused with
+# ./Dockerfile, which builds the Malloyyo server for self-hosting (docs/docker.md).
+#
+# It carries the toolchain a model AUTHOR needs and a browser IDE to drive it, so
+# a model repo can be worked on with nothing installed but Docker:
+#
+#     docker run -d -p 127.0.0.1:8080:8080 \
+#       -v malloyyo-home:/home/node \
+#       -e REPO_URL=https://github.com/malloydata/malloyyo-ecommerce \
+#       ghcr.io/malloydata/malloyyo-dev
+#
+# Clones the repo INSIDE the container, serves VS Code on 8080, and leaves the
+# dashboard ports free for `malloyyo dashboard dev`. See docs/devcontainer.md.
+#
+# It is big: the Google Cloud SDK is ~730 MB and code-server another ~350 MB.
+# That is the trade — pull once, and never ask an analyst to install a C++
+# toolchain before their first query.
+
+ARG NODE_VERSION=24-bookworm-slim
+FROM node:${NODE_VERSION}
+
+LABEL org.opencontainers.image.source="https://github.com/malloydata/malloyyo"
+LABEL org.opencontainers.image.description="Development environment for Malloy model repos: VS Code in the browser, the malloyyo CLI, Claude Code, gh, and the Google Cloud SDK."
+
+# Pinned so the image and the CLI a project expects cannot drift silently. The
+# publish workflow overrides MALLOYYO_VERSION with the version it is releasing.
+ARG MALLOYYO_VERSION=0.2.40
+ARG CODE_SERVER_VERSION=4.136.2
+# Claude Code ships several times a week and updates itself in place, so pinning
+# it buys staleness rather than reproducibility.
+ARG CLAUDE_CODE_VERSION=latest
+
+# The slim base carries neither git nor a compiler. Both are load-bearing: git
+# because the entrypoint clones the model repo, and the toolchain because `lz4`
+# — reached through @malloydata/malloy — publishes no prebuilt binary and is
+# compiled by node-gyp during the npm install below. `sudo` is here because a
+# dev container that cannot install a package is a dev container people leave.
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        git openssh-client ca-certificates curl gnupg less procps sudo \
+        build-essential python3; \
+    echo 'node ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/node; \
+    chmod 0440 /etc/sudoers.d/node; \
+    rm -rf /var/lib/apt/lists/*
+
+# Google Cloud SDK — `gcloud` and `bq`. Application Default Credentials written
+# by `gcloud auth application-default login` are what @malloydata/db-bigquery
+# reads, so this is the "log in the usual way" path for a BigQuery model. The
+# apt repo serves amd64 and arm64, so this layer builds on both.
+RUN set -eux; \
+    curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+        | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+        > /etc/apt/sources.list.d/google-cloud-sdk.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends google-cloud-cli; \
+    rm -rf /var/lib/apt/lists/*
+
+# gh — cloning private model repos, and pushing the branch you just authored.
+# `gh auth login --web` is a device flow, so it works with nothing published.
+RUN set -eux; \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg; \
+    chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg; \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gh; \
+    rm -rf /var/lib/apt/lists/*
+
+# code-server — VS Code served over HTTP. Released per-architecture, so the
+# .deb is selected by the build platform rather than hardcoded.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    curl -fsSL -o /tmp/code-server.deb \
+        "https://github.com/coder/code-server/releases/download/v${CODE_SERVER_VERSION}/code-server_${CODE_SERVER_VERSION}_${arch}.deb"; \
+    dpkg -i /tmp/code-server.deb; \
+    rm -f /tmp/code-server.deb
+
+# The two CLIs the author actually drives. Installed as root into the global
+# prefix so every user in the container sees them.
+#
+# docker/local-cli/ is normally empty and the CLI comes from npm. Drop a tarball
+# in it (`npm pack -w packages/cli`) to build the image against an UNRELEASED
+# CLI — the only way to test a change to packages/cli inside the image before
+# publishing it, since every other path installs whatever npm already has.
+COPY docker/local-cli/ /tmp/local-cli/
+RUN set -eux; \
+    if ls /tmp/local-cli/*.tgz >/dev/null 2>&1; then \
+        echo "installing malloyyo from a local tarball (UNRELEASED build):"; \
+        ls -1 /tmp/local-cli/*.tgz; \
+        npm install -g /tmp/local-cli/*.tgz; \
+    else \
+        npm install -g "@malloydata/malloyyo@${MALLOYYO_VERSION}"; \
+    fi; \
+    npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; \
+    rm -rf /tmp/local-cli; \
+    npm cache clean --force
+
+COPY docker/dev-entrypoint.sh /usr/local/bin/dev-entrypoint
+RUN chmod +x /usr/local/bin/dev-entrypoint
+
+# No MALLOYYO_OAUTH_PORT/HOST, and no port for sign-in.
+#
+# Those existed to make `malloyyo login`'s loopback redirect reachable from a
+# browser outside the container — pin a port, publish it, hope. The device
+# authorization grant removes the inbound connection altogether: the CLI prints a
+# URL and a code and then polls, so nothing here has to listen. That is also the
+# only thing that can work in a Codespace, where `localhost` in the browser is
+# the user's own laptop.
+#
+# The CLI still falls back to the loopback flow against an instance too old to
+# advertise the device endpoint. If you hit that, set MALLOYYO_OAUTH_PORT and
+# MALLOYYO_OAUTH_HOST=0.0.0.0 at run time and publish that port — it is a
+# workaround for old servers, not something this image should pre-configure.
+
+# Where the model repo lands. Under /home/node deliberately: one volume then
+# covers the working tree AND the credentials in ~/.config, so a restart does
+# not cost you both your uncommitted edits and every login.
+ENV WORKSPACE_DIR=/home/node/workspace
+
+# 8080 is code-server; 4173 is `malloyyo dashboard dev`.
+#
+# Two ports that used to be here are gone. The artifact's second origin (4174)
+# no longer exists — the sandboxed frame is isolated by its opaque origin and
+# served from the same port — and sign-in no longer listens at all (see above).
+#
+# Publishing 4173 is optional: dashboards are reachable through code-server's
+# proxy at 8080, on whatever `--port` you chose, which is what makes this work
+# where you do not control port publishing.
+EXPOSE 8080 4173
+
+USER node
+
+# Bake the Malloy extension in, so a fresh container opens with language support
+# rather than downloading it. code-server resolves from Open VSX rather than the
+# Microsoft marketplace; malloydata.malloy-vscode is published there.
+RUN code-server --install-extension malloydata.malloy-vscode
+
+# DuckDB fetches `httpfs` the first time a model reads Parquet or CSV over
+# HTTPS, which is most of them. Installing it here means a fresh container's
+# first query is a query rather than a download, and running it as `node` puts
+# it in the ~/.duckdb the runtime user actually reads.
+RUN cd /tmp && malloyyo sql -e "INSTALL httpfs"
+
+WORKDIR /home/node
+ENTRYPOINT ["/usr/local/bin/dev-entrypoint"]
+CMD ["code-server"]

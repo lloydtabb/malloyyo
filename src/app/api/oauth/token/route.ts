@@ -5,6 +5,7 @@ import { NextResponse } from "next/server";
 import { consumeAuthorizationCode, verifyPkce } from "@/lib/oauth/codes";
 import { getOAuthClient } from "@/lib/oauth/clients";
 import { issueTokenPair, rotateRefreshToken } from "@/lib/oauth/tokens";
+import { pollDeviceCode, DEVICE_GRANT_TYPE } from "@/lib/oauth/device-codes";
 import { corsPreflight, withCors } from "@/lib/oauth/cors";
 import { logger } from "@/lib/logger";
 
@@ -18,6 +19,7 @@ interface TokenRequest {
   client_id?: string;
   code_verifier?: string;
   refresh_token?: string;
+  device_code?: string;
   resource?: string;
 }
 
@@ -58,6 +60,7 @@ export async function POST(request: Request): Promise<Response> {
   if (!body) return err("invalid_request", "Could not parse request body");
   if (body.grant_type === "authorization_code") return handleAuthorizationCode(body);
   if (body.grant_type === "refresh_token") return handleRefreshToken(body);
+  if (body.grant_type === DEVICE_GRANT_TYPE) return handleDeviceCode(body);
   return err("unsupported_grant_type", `grant_type "${body.grant_type ?? ""}" is not supported`);
 }
 
@@ -79,6 +82,46 @@ async function handleAuthorizationCode(body: TokenRequest): Promise<Response> {
 
   const tokens = await issueTokenPair({ clientId: row.clientId, userId: row.userId, scope: row.scope, resource: row.resource });
   return tokenResponse(tokens.accessToken, tokens.refreshToken, tokens.expiresIn, row.scope);
+}
+
+// RFC 8628 §3.4–3.5. The client polls here while a human decides, so most calls
+// are expected to "fail" with authorization_pending — that is the protocol, not an
+// error condition. No PKCE: there is no redirect to intercept, and the device_code
+// itself is the 32-byte secret, held only by the client that requested it.
+async function handleDeviceCode(body: TokenRequest): Promise<Response> {
+  const { device_code, client_id } = body;
+  if (!device_code || !client_id)
+    return err("invalid_request", "device_code and client_id are required");
+
+  const client = await getOAuthClient(client_id);
+  if (!client) return err("invalid_client", "Unknown client_id");
+
+  const result = await pollDeviceCode(device_code, client_id);
+  switch (result.status) {
+    case "pending":
+      // 400 with this code is what the RFC specifies; the client keeps polling.
+      return err("authorization_pending", "The user has not yet approved this request");
+    case "slow_down":
+      return err("slow_down", "Polling too frequently — increase the interval by 5 seconds");
+    case "denied":
+      return err("access_denied", "The user denied this request");
+    case "expired":
+      return err("expired_token", "This device code has expired — start a new request");
+    case "not_found":
+      return err("invalid_grant", "Unknown, already used, or mismatched device_code");
+    case "approved": {
+      const row = result.row;
+      const tokens = await issueTokenPair({
+        clientId: row.clientId,
+        // Non-null by construction: pollDeviceCode only reports approved when a
+        // user is bound to the row.
+        userId: row.userId as string,
+        scope: row.scope,
+        resource: row.resource,
+      });
+      return tokenResponse(tokens.accessToken, tokens.refreshToken, tokens.expiresIn, row.scope);
+    }
+  }
 }
 
 async function handleRefreshToken(body: TokenRequest): Promise<Response> {
