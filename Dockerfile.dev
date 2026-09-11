@@ -82,10 +82,22 @@ RUN set -eux; \
 
 # The two CLIs the author actually drives. Installed as root into the global
 # prefix so every user in the container sees them.
+#
+# docker/local-cli/ is normally empty and the CLI comes from npm. Drop a tarball
+# in it (`npm pack -w packages/cli`) to build the image against an UNRELEASED
+# CLI — the only way to test a change to packages/cli inside the image before
+# publishing it, since every other path installs whatever npm already has.
+COPY docker/local-cli/ /tmp/local-cli/
 RUN set -eux; \
-    npm install -g \
-        "@malloydata/malloyyo@${MALLOYYO_VERSION}" \
-        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; \
+    if ls /tmp/local-cli/*.tgz >/dev/null 2>&1; then \
+        echo "installing malloyyo from a local tarball (UNRELEASED build):"; \
+        ls -1 /tmp/local-cli/*.tgz; \
+        npm install -g /tmp/local-cli/*.tgz; \
+    else \
+        npm install -g "@malloydata/malloyyo@${MALLOYYO_VERSION}"; \
+    fi; \
+    npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"; \
+    rm -rf /tmp/local-cli; \
     npm cache clean --force
 
 COPY docker/dev-entrypoint.sh /usr/local/bin/dev-entrypoint

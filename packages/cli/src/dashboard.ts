@@ -41,6 +41,16 @@ const resolveFrameEntry = (): string => path.join(resolveRuntimeDir(), "..", "fr
 const resolveInPageEntry = (): string => path.join(resolveRuntimeDir(), "..", "frame-inpage-entry.tsx");
 
 
+/** Make arbitrary JS safe to place INSIDE a <script> element.
+
+    The HTML parser ends a script block at the first `</script`, wherever it
+    appears — including inside a JS string literal. A dashboard whose code merely
+    mentions that text would otherwise terminate the element early and spill the
+    rest of the bundle into the document as markup. `<\/script` is the same
+    string to JS and invisible to the parser. Today's bundles happen to contain
+    none, which is a property of the data, not a guarantee. */
+const inlineScript = (js: string) => js.replace(/<\/(script)/gi, String.raw`<\/$1`);
+
 const esc = (s: string) =>
   s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 
@@ -169,6 +179,10 @@ export const DEV_PATHS = {
   inPage: (n: string) => `inpage.js?d=${encodeURIComponent(n)}`,
   /** Artifact bundle, for a dashboard with a Dashboard.tsx. */
   bundle: (n: string) => `bundle.js?d=${encodeURIComponent(n)}`,
+  /** The sandboxed artifact document. Same origin as the shell, relative like
+      everything else — the iframe is isolated by its OPAQUE origin (the
+      `allow-scripts`-only sandbox), not by living on a second port. */
+  frame: (n: string) => `frame?d=${encodeURIComponent(n)}`,
   /** Live-reload stream. */
   events: "events",
   /** The privileged query broker the parent shell brokers postMessage into. */
@@ -221,7 +235,6 @@ function inPageShell(
 
 function parentShell(
   dash: Dashboard,
-  frameBase: string,
   all: Dashboard[],
   initialGivens: Record<string, string>,
   initialUrlState: Record<string, string>,
@@ -231,22 +244,29 @@ function parentShell(
   const givensQs = Object.entries({ ...initialGivens, ...initialUrlState })
     .map(([k, v]) => `&${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
     .join("");
-  // Trusted broker: forwards a run request from the sandboxed frame to /api/run
-  // (same-origin to THIS page), then posts the result back into the frame. The
-  // frame is served from `frameBase` (a DIFFERENT port = different origin), so
-  // `allow-same-origin` gives it a real origin — its worker/wasm/font loads
-  // succeed — while it stays cross-origin to this shell: it can't read us or
-  // call /api/run directly, only postMessage. See docs/repo-artifacts.md §7/§8.
+  // Trusted broker: forwards a run request from the sandboxed frame to api/run
+  // (same-origin to THIS page), then posts the result back into the frame.
+  //
+  // The frame is isolated by its OPAQUE ORIGIN: `allow-scripts` WITHOUT
+  // allow-same-origin, exactly as the hosted server does it
+  // (CustomDashboardFrame.tsx). It therefore cannot read this document, reach
+  // api/run, or carry a cookie — while needing no second port, which is what
+  // lets the whole dev server work behind a proxy. The dev server has no auth,
+  // so unlike hosted it needs no capability token for the bundle.
+  //
+  // Two consequences of an opaque origin, both mirrored from hosted:
+  //   - inbound messages report `origin: "null"`, so SOURCE identity is the
+  //     guard; there is no meaningful origin to compare.
+  //   - outbound must target "*", because an opaque origin cannot be named.
   const d = safeJson(dash.name);
-  const fb = safeJson(frameBase);
   const nav = navHtml(dash, all);
   return html(
     `<div style="display:flex;flex-direction:column;height:100vh">` +
       nav +
       // allow-popups(+escape-sandbox): let a # link mark open its target in a
       // normal new tab on click instead of being blocked by the sandbox.
-      `<iframe id="f" sandbox="allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox"` +
-      ` src="${frameBase}/frame?d=${encodeURIComponent(dash.name)}${givensQs}"` +
+      `<iframe id="f" sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"` +
+      ` src="${DEV_PATHS.frame(dash.name)}${givensQs}"` +
       ` style="border:0;flex:1;width:100%"></iframe>` +
       `</div>` +
       `<script>
@@ -266,7 +286,7 @@ function shareUrl(dashboard){
   return u.pathname+u.search;
 }
 window.addEventListener('message',async(e)=>{
-  if(e.source!==f.contentWindow||e.origin!==${fb})return;
+  if(e.source!==f.contentWindow)return;
   const m=e.data;
   if(m&&m.type==='givens'){
     G=m.givens||{};
@@ -292,7 +312,7 @@ window.addEventListener('message',async(e)=>{
       body:JSON.stringify({d:${d},query:m.query,malloy:m.malloy,givens:m.givens,dashboard:m.dashboard})});
     out=await res.json();
   }catch(err){ out={ok:false,problems:[{message:String(err)}]}; }
-  f.contentWindow.postMessage({type:'result',id:m.id,...out},${fb});
+  f.contentWindow.postMessage({type:'result',id:m.id,...out},'*');
 });
 </script>`,
     dash.title,
@@ -315,6 +335,7 @@ function frameDoc(
   givenSpecs: GivenSpec[],
   initialGivens: Record<string, string>,
   initialUrlState: Record<string, string>,
+  bundleJs: string,
   tileSpecs?: TileSpec[],
 ): string {
   // NOTE (prototype): the `sandbox` attribute is the containment here. A
@@ -340,7 +361,14 @@ function frameDoc(
       `window.__GIVENS__=${safeJson(givenSpecs)};` +
       `window.__INITIAL_GIVENS__=${safeJson(initialGivens)};` +
       `window.__INITIAL_URLSTATE__=${safeJson(initialUrlState)}</script>` +
-      `<script src="${DEV_PATHS.bundle(dash.name)}"></script>`,
+      // INLINED, not fetched. The frame is an opaque origin, so every request it
+      // makes is cross-site and carries no SameSite cookie — and the proxies this
+      // must work behind (code-server, a Codespaces forwarded port) authenticate
+      // with exactly such a cookie. The document navigation IS initiated by the
+      // parent and does carry it, so shipping the code inside that response means
+      // the frame never makes a second request. Measured: the bundle was the
+      // frame's only subresource, so this removes all of them.
+      `<script>${inlineScript(bundleJs)}</script>`,
     dash.title,
   );
 }
@@ -362,8 +390,7 @@ export async function serveDashboard(opts: {
   // its iframe use `allow-same-origin` (so Malloy's renderer can load workers/
   // wasm) while staying cross-origin to the trusted shell — the frame still
   // can't read the shell or reach /api/run except via postMessage.
-  const framePort = port + 1;
-  const frameBase = `http://localhost:${framePort}`;
+
 
   const runner: ModelRunner = await makeRunner(root);
   if (!runner.entryExists()) {
@@ -435,35 +462,34 @@ export async function serveDashboard(opts: {
   }
 
   const handler = async (req: http.IncomingMessage, res: http.ServerResponse) => {
-    const onFramePort = (req.socket.localPort ?? port) === framePort;
-    const url = new URL(req.url ?? "/", `http://localhost:${onFramePort ? framePort : port}`);
+    const url = new URL(req.url ?? "/", `http://localhost:${port}`);
     const send = (code: number, type: string, body: string, extra: Record<string, string> = {}) => {
       res.writeHead(code, { "content-type": type, ...extra });
       res.end(body);
     };
     try {
-      // Frame origin (port+1): ONLY the untrusted artifact document + its bundle.
-      // Never /api/run — so the frame (same-origin only to THIS port) can't reach
-      // the runner on its own origin.
-      if (onFramePort) {
-        if (url.pathname === "/frame") {
-          // Given specs are introspected from the model PER LOAD, so an edit to
-          // a `given:` declaration (type, default, tags) shows up on reload.
-          const dash = pick(url);
-          const g = await resolveGivens(dash);
-          if (!g.ok) {
-            return send(200, "text/html; charset=utf-8",
-              html(`<pre style="color:crimson;padding:16px">model error: ${esc(g.error)}</pre>`, dash.title));
-          }
+      // The untrusted artifact document and its bundle, served from the SAME
+      // origin as the shell. Safe because the iframe loading them runs
+      // `allow-scripts` without allow-same-origin: an opaque origin, so the
+      // guest cannot reach api/run, read the shell, or carry a cookie — even
+      // though the bytes came from here. Same model as the hosted server.
+      if (url.pathname === "/frame") {
+        // Given specs are introspected from the model PER LOAD, so an edit to
+        // a `given:` declaration (type, default, tags) shows up on reload.
+        const dash = pick(url);
+        const g = await resolveGivens(dash);
+        if (!g.ok) {
           return send(200, "text/html; charset=utf-8",
-            frameDoc(dash, dashboards, g.union, givensFromUrl(url), urlStateFromUrl(url), g.tiles));
-        }
-        if (url.pathname === "/bundle.js") {
-          return send(200, "application/javascript; charset=utf-8", await bundle(pick(url)));
-        }
-        return send(404, "text/plain", "not found");
+            html(`<pre style="color:crimson;padding:16px">model error: ${esc(g.error)}</pre>`, dash.title));
       }
-      // Parent origin: the trusted shell + the runner.
+        return send(200, "text/html; charset=utf-8",
+          frameDoc(dash, dashboards, g.union, givensFromUrl(url), urlStateFromUrl(url),
+            await bundle(dash), g.tiles), { "cache-control": "no-store" });
+      }
+      if (url.pathname === "/bundle.js") {
+        return send(200, "application/javascript; charset=utf-8", await bundle(pick(url)));
+      }
+      // The trusted shell + the runner.
       // Live-reload stream: the shell subscribes and reloads on a file change.
       if (url.pathname === "/events") {
         res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
@@ -484,16 +510,19 @@ export async function serveDashboard(opts: {
               html(`<pre style="color:crimson;padding:16px">model error: ${esc(g.error)}</pre>`, dash.title));
           }
           return send(200, "text/html; charset=utf-8",
-            inPageShell(dash, dashboards, g.union, givensFromUrl(url), urlStateFromUrl(url), g.tiles));
+            inPageShell(dash, dashboards, g.union, givensFromUrl(url), urlStateFromUrl(url), g.tiles),
+            { "cache-control": "no-store" });
         }
         return send(200, "text/html; charset=utf-8",
-          parentShell(dash, frameBase, dashboards, givensFromUrl(url), urlStateFromUrl(url)));
+          parentShell(dash, dashboards, givensFromUrl(url), urlStateFromUrl(url)),
+          { "cache-control": "no-store" });
       }
       // The in-page bundle (tag-only): served SAME-ORIGIN as the trusted shell —
       // it IS trusted (no untrusted author code), so it may fetch /api/run
       // directly. Custom dashboards' bundle stays on the frame origin (/bundle.js).
       if (url.pathname === "/inpage.js") {
-        return send(200, "application/javascript; charset=utf-8", await inPageBundle());
+        return send(200, "application/javascript; charset=utf-8", await inPageBundle(),
+          { "cache-control": "no-store" });
       }
       if (url.pathname === "/api/run" && req.method === "POST") {
         const { d, query, malloy, givens } = JSON.parse(await readBody(req));
@@ -523,12 +552,13 @@ export async function serveDashboard(opts: {
     }
   };
 
+  // ONE listener. The artifact's isolation is its opaque origin, not a second
+  // port — so there is no second port to bind, publish, or proxy. That is what
+  // makes `dashboard dev` work unchanged behind a path proxy.
   const shellServer = http.createServer(handler);
-  const frameServer = http.createServer(handler);
   await new Promise<void>((r) => shellServer.listen(port, r));
-  await new Promise<void>((r) => frameServer.listen(framePort, r));
   console.error(`\n  malloyyo dashboard dev — model: ${root}`);
-  console.error(`  http://localhost:${port}/   (artifact origin: ${frameBase})`);
+  console.error(`  http://localhost:${port}/`);
   for (const d of dashboards) {
     const kind = d.tsxPath ? "custom (iframe)" : "tag-only (in-page)";
     console.error(`    • ${d.name} (${kind})  →  http://localhost:${port}/?d=${d.name}`);
