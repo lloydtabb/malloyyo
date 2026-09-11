@@ -6,7 +6,7 @@
 # It carries the toolchain a model AUTHOR needs and a browser IDE to drive it, so
 # a model repo can be worked on with nothing installed but Docker:
 #
-#     docker run -d -p 127.0.0.1:8080:8080 -p 4173:4173 -p 4174:4174 \
+#     docker run -d -p 127.0.0.1:8080:8080 \
 #       -v malloyyo-home:/home/node \
 #       -e REPO_URL=https://github.com/malloydata/malloyyo-ecommerce \
 #       ghcr.io/malloydata/malloyyo-dev
@@ -103,25 +103,35 @@ RUN set -eux; \
 COPY docker/dev-entrypoint.sh /usr/local/bin/dev-entrypoint
 RUN chmod +x /usr/local/bin/dev-entrypoint
 
-# `malloyyo login` completes its OAuth round trip by listening for a redirect on
-# THIS machine. On a laptop any free loopback port works; in a container neither
-# half holds — the port has to be known in advance to be published, and the
-# forwarded connection arrives on the container's interface rather than its
-# loopback. Pinning both means `malloyyo login` works as long as 41121 is
-# published. The listener is up only for the duration of a sign-in and the
-# exchange is protected by PKCE + state.
-ENV MALLOYYO_OAUTH_PORT=41121 \
-    MALLOYYO_OAUTH_HOST=0.0.0.0
+# No MALLOYYO_OAUTH_PORT/HOST, and no port for sign-in.
+#
+# Those existed to make `malloyyo login`'s loopback redirect reachable from a
+# browser outside the container — pin a port, publish it, hope. The device
+# authorization grant removes the inbound connection altogether: the CLI prints a
+# URL and a code and then polls, so nothing here has to listen. That is also the
+# only thing that can work in a Codespace, where `localhost` in the browser is
+# the user's own laptop.
+#
+# The CLI still falls back to the loopback flow against an instance too old to
+# advertise the device endpoint. If you hit that, set MALLOYYO_OAUTH_PORT and
+# MALLOYYO_OAUTH_HOST=0.0.0.0 at run time and publish that port — it is a
+# workaround for old servers, not something this image should pre-configure.
 
 # Where the model repo lands. Under /home/node deliberately: one volume then
 # covers the working tree AND the credentials in ~/.config, so a restart does
 # not cost you both your uncommitted edits and every login.
 ENV WORKSPACE_DIR=/home/node/workspace
 
-# 8080 is code-server. 4173 serves the dashboard shell; `malloyyo dashboard dev`
-# renders custom (iframe) dashboards from a separate artifact origin on 4174,
-# and they come up blank without it. 41121 is the sign-in redirect above.
-EXPOSE 8080 4173 4174 41121
+# 8080 is code-server; 4173 is `malloyyo dashboard dev`.
+#
+# Two ports that used to be here are gone. The artifact's second origin (4174)
+# no longer exists — the sandboxed frame is isolated by its opaque origin and
+# served from the same port — and sign-in no longer listens at all (see above).
+#
+# Publishing 4173 is optional: dashboards are reachable through code-server's
+# proxy at 8080, on whatever `--port` you chose, which is what makes this work
+# where you do not control port publishing.
+EXPOSE 8080 4173
 
 USER node
 

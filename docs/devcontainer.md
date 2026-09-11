@@ -12,7 +12,7 @@ Published at `ghcr.io/malloydata/malloyyo-dev`, for `linux/amd64` and
 
 ```bash
 docker run -d --name malloyyo \
-  -p 127.0.0.1:8080:8080 -p 4173:4173 -p 4174:4174 -p 41121:41121 \
+  -p 127.0.0.1:8080:8080 \
   -v malloyyo-home:/home/node \
   -e REPO_URL=https://github.com/malloydata/malloyyo-ecommerce \
   ghcr.io/malloydata/malloyyo-dev:latest
@@ -22,6 +22,11 @@ docker logs malloyyo    # prints the URL and the generated password
 
 Open <http://localhost:8080/>. The repo is cloned to `/home/node/workspace`;
 nothing touches your filesystem.
+
+**One published port.** Dashboards are reached through code-server's proxy —
+`http://localhost:8080/proxy/4173/` for `malloyyo dashboard dev`, and the same for
+whatever `--port` you pick, with nothing to republish. Add `-p 4173:4173` if you
+would rather hit the dashboard server directly.
 
 Leave `REPO_URL` off and you get an empty workspace and a terminal — clone
 whatever you like from there.
@@ -61,12 +66,14 @@ and paste the code back at the prompt. No port needed: the OAuth redirect
 terminates on Anthropic's servers, not on localhost. `claude setup-token` gets
 you a long-lived token instead.
 
-**Malloyyo** — `malloyyo login`. This one *does* redirect to a port on this
-machine, so it needs `-p 41121:41121` (the image pins `MALLOYYO_OAUTH_PORT` and
-`MALLOYYO_OAUTH_HOST` for exactly that). Works where your browser and the
-container share `localhost` — Docker on your own machine. On a remote host they
-don't, so use a token (`--token`, or the env var named in your `malloyyo` config
-block) until a device-code flow lands.
+**Malloyyo** — `malloyyo login`. It prints a URL and a short code; open the URL,
+sign in if you are not already, and type the code. Nothing listens and no port is
+involved, which is why it behaves the same here, in a Codespace, and over SSH.
+
+(Against an instance too old to advertise the device flow, the CLI falls back to a
+loopback redirect, which does need a reachable port: set `MALLOYYO_OAUTH_PORT`
+and `MALLOYYO_OAUTH_HOST=0.0.0.0` and publish that port. Or use a token —
+`--token`, or the env var named in your `malloyyo` config block.)
 
 **Google / BigQuery** — `gcloud auth application-default login --no-launch-browser`.
 That writes Application Default Credentials to `~/.config/gcloud`, which is what
@@ -101,8 +108,7 @@ is already populated and skips the clone.
   "name": "malloy-model",
   "image": "ghcr.io/malloydata/malloyyo-dev:latest",
   "overrideCommand": true,
-  "forwardPorts": [4173, 4174],
-  "appPort": ["41121:41121"],
+  "forwardPorts": [4173],
   "customizations": {
     "vscode": { "extensions": ["malloydata.malloy-vscode"] }
   }
